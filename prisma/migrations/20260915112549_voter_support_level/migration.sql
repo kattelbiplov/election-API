@@ -1,0 +1,5 @@
+-- CreateEnum
+CREATE TYPE "VoterSupportLevel" AS ENUM ('STRONG_SUPPORTER', 'LEAN_SUPPORTER', 'UNDECIDED', 'LEAN_OPPOSED', 'STRONG_OPPOSED', 'UNKNOWN');
+
+-- AlterTable
+ALTER TABLE "voters" ADD COLUMN     "support_level" "VoterSupportLevel" NOT NULL DEFAULT 'UNKNOWN';

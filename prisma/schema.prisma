@@ -1,0 +1,794 @@
+// Election Operations & Voter Intelligence Platform
+// Module 01: Auth / RBAC / Nepal Geo Structure
+//
+// Design notes (read before extending):
+// - `Organization` is the tenant root. Every campaign that uses this platform is one
+//   Organization. This is added in module 1 (even though multi-tenant SaaS is a Phase-3
+//   goal) because retrofitting a tenant column onto Users/Households/Voters after data
+//   exists is far more expensive than carrying an unused-for-now FK today.
+// - Province/District/Municipality/Ward are Nepal's *official* administrative hierarchy.
+//   They are treated as global reference data (not owned by any Organization) because the
+//   same administrative geography applies to every campaign operating in that area.
+// - `Tole` is informal (toles are not official government units — names and boundaries
+//   vary by source and campaign), so it is the first level that is Organization-scoped.
+//   Two campaigns operating in the same ward may define their toles differently.
+// - Geometry/GPS fields are deliberately plain (Float lat/lng, Json boundary) in this
+//   module. The PostGIS extension is enabled by the initial migration so it is available,
+//   but native `geometry` columns + spatial indexes are introduced in the Household GIS
+//   module (spec section 7/10) where they are actually needed. Adding them now would be
+//   premature for a module that only manages the administrative tree.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Tenancy
+// ---------------------------------------------------------------------------
+
+enum OrganizationStatus {
+  ACTIVE
+  SUSPENDED
+}
+
+model Organization {
+  id        String             @id @default(uuid())
+  name      String
+  slug      String             @unique
+  status    OrganizationStatus @default(ACTIVE)
+  createdAt DateTime           @default(now()) @map("created_at")
+  updatedAt DateTime           @updatedAt @map("updated_at")
+
+  users              User[]
+  toles              Tole[]
+  households         Household[]
+  voters             Voter[]
+  voterImportJobs    VoterImportJob[]
+  canvassingTasks    CanvassingTask[]
+  voterContacts      VoterContact[]
+  voterRelationships VoterRelationship[]
+
+  @@map("organizations")
+}
+
+// ---------------------------------------------------------------------------
+// Users / Auth / RBAC
+// ---------------------------------------------------------------------------
+
+enum UserRole {
+  SUPER_ADMIN
+  CAMPAIGN_ADMIN
+  WARD_MANAGER
+  TOLE_COORDINATOR
+  FIELD_WORKER
+  // Same permission set as FIELD_WORKER (see ROLE_PERMISSIONS in
+  // src/middleware/permissions.ts, which defines VOLUNTEER's array as a copy
+  // of FIELD_WORKER's so the two can't drift apart silently) — kept as a
+  // separate role rather than reusing FIELD_WORKER because campaigns track
+  // volunteers (unpaid, roster-managed) as a distinct population from paid
+  // field staff, even though today they can do the same things in the app.
+  VOLUNTEER
+  ANALYST
+  VIEW_ONLY
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  INVITED
+}
+
+model User {
+  id             String       @id @default(uuid())
+  organizationId String       @map("organization_id")
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  name         String
+  email        String     @unique
+  phone        String?
+  passwordHash String     @map("password_hash")
+  role         UserRole
+  status       UserStatus @default(ACTIVE)
+
+  // Optional bio fields — relevant mainly for VOLUNTEER (and FIELD_WORKER)
+  // accounts; left null for admin/analyst-type roles. Kept directly on User
+  // rather than a separate profile table since it's a handful of nullable
+  // columns, not a growing set — same reasoning as `phone` above. Reuses the
+  // `Gender` enum introduced for Voter in the Module 02 section below.
+  address     String?
+  dateOfBirth DateTime? @map("date_of_birth") @db.Date
+  gender      Gender?
+
+  lastLoginAt DateTime? @map("last_login_at")
+
+  createdById  String? @map("created_by_id")
+  createdBy    User?   @relation("UserCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  createdUsers User[]  @relation("UserCreatedBy")
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  refreshTokens      RefreshToken[]
+  geoAssignments     UserGeoAssignment[]
+  auditLogs          AuditLog[]
+  uploadedImportJobs VoterImportJob[]
+  assignedTasks      CanvassingTask[]    @relation("TaskAssignedTo")
+  createdTasks       CanvassingTask[]    @relation("TaskCreatedBy")
+  recordedVisits     CanvassingVisit[]   @relation("VisitRecordedBy")
+  loggedContacts     VoterContact[]      @relation("VoterContactedBy")
+
+  @@index([organizationId])
+  @@index([role])
+  @@map("users")
+}
+
+// Which geographic unit(s) a user is operationally responsible for.
+// WARD_MANAGER -> wardId set, toleId null.
+// TOLE_COORDINATOR / FIELD_WORKER / VOLUNTEER -> toleId set (wardId denormalized for fast filtering).
+// CAMPAIGN_ADMIN / ANALYST / VIEW_ONLY / SUPER_ADMIN typically have no row (org-wide access).
+model UserGeoAssignment {
+  id     String @id @default(uuid())
+  userId String @map("user_id")
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  wardId String @map("ward_id")
+  ward   Ward   @relation(fields: [wardId], references: [id], onDelete: Cascade)
+
+  toleId String? @map("tole_id")
+  tole   Tole?   @relation(fields: [toleId], references: [id], onDelete: Cascade)
+
+  assignedAt DateTime @default(now()) @map("assigned_at")
+
+  // Not a @@unique([userId, wardId, toleId]): toleId is nullable, and Postgres
+  // treats every NULL as distinct in a unique index, so it would not actually
+  // stop duplicate ward-level (toleId = null) assignments. Idempotency for
+  // "assign the same ward/tole twice" is enforced in the service layer
+  // (find-then-create) instead. See users.service.ts assignGeo().
+  @@index([userId])
+  @@index([wardId])
+  @@index([toleId])
+  @@map("user_geo_assignments")
+}
+
+model RefreshToken {
+  id                  String    @id @default(uuid())
+  userId              String    @map("user_id")
+  user                User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash           String    @unique @map("token_hash")
+  expiresAt           DateTime  @map("expires_at")
+  revokedAt           DateTime? @map("revoked_at")
+  replacedByTokenHash String?   @map("replaced_by_token_hash")
+  createdByIp         String?   @map("created_by_ip")
+  userAgent           String?   @map("user_agent")
+  createdAt           DateTime  @default(now()) @map("created_at")
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+// ---------------------------------------------------------------------------
+// Nepal administrative geography (global reference data)
+// ---------------------------------------------------------------------------
+
+model Province {
+  id         String  @id @default(uuid())
+  code       Int     @unique // official province number, e.g. 1-7
+  name       String
+  nameNepali String? @map("name_nepali")
+
+  districts District[]
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("provinces")
+}
+
+model District {
+  id         String   @id @default(uuid())
+  provinceId String   @map("province_id")
+  province   Province @relation(fields: [provinceId], references: [id], onDelete: Restrict)
+  code       String // official district code
+  name       String
+  nameNepali String?  @map("name_nepali")
+
+  municipalities Municipality[]
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([provinceId, code])
+  @@map("districts")
+}
+
+enum MunicipalityType {
+  METROPOLITAN_CITY
+  SUB_METROPOLITAN_CITY
+  MUNICIPALITY
+  RURAL_MUNICIPALITY
+}
+
+model Municipality {
+  id         String           @id @default(uuid())
+  districtId String           @map("district_id")
+  district   District         @relation(fields: [districtId], references: [id], onDelete: Restrict)
+  code       String // official local-level code (e.g. EC/NSO code)
+  name       String
+  nameNepali String?          @map("name_nepali")
+  type       MunicipalityType
+  totalWards Int              @map("total_wards")
+
+  wards Ward[]
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([districtId, code])
+  @@index([districtId])
+  @@map("municipalities")
+}
+
+model Ward {
+  id             String       @id @default(uuid())
+  municipalityId String       @map("municipality_id")
+  municipality   Municipality @relation(fields: [municipalityId], references: [id], onDelete: Restrict)
+  wardNumber     Int          @map("ward_number")
+  name           String?
+  population     Int?
+
+  toles           Tole[]
+  geoAssignments  UserGeoAssignment[]
+  households      Household[]
+  voters          Voter[]
+  voterImportJobs VoterImportJob[]
+  canvassingTasks CanvassingTask[]
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([municipalityId, wardNumber])
+  @@index([municipalityId])
+  @@map("wards")
+}
+
+// Tole is Organization-scoped — see design note at top of file.
+model Tole {
+  id             String       @id @default(uuid())
+  organizationId String       @map("organization_id")
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  wardId         String       @map("ward_id")
+  ward           Ward         @relation(fields: [wardId], references: [id], onDelete: Restrict)
+
+  name       String
+  nameNepali String? @map("name_nepali")
+
+  // Informal centroid for map placement; not a substitute for the PostGIS
+  // geometry columns introduced in the Household GIS module.
+  centerLat Float? @map("center_lat")
+  centerLng Float? @map("center_lng")
+  boundary  Json? // GeoJSON polygon as submitted/returned over the API
+
+  // Real PostGIS polygon derived from `boundary` by the service layer
+  // (geo.geometry.ts syncToleBoundaryGeom) on every create/update where
+  // boundary is set. `boundary` (Json) stays the wire format so the API
+  // contract is unchanged; this column is what ST_Contains queries run
+  // against — see docs/modules/03-household-gis.md.
+  boundaryGeom Unsupported("geometry(Polygon, 4326)")? @map("boundary_geom")
+
+  createdById String? @map("created_by_id")
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  geoAssignments  UserGeoAssignment[]
+  households      Household[]
+  voters          Voter[]
+  voterImportJobs VoterImportJob[]
+  canvassingTasks CanvassingTask[]
+
+  @@unique([organizationId, wardId, name])
+  @@index([wardId])
+  @@index([organizationId])
+  @@index([boundaryGeom], type: Gist)
+  @@map("toles")
+}
+
+// ---------------------------------------------------------------------------
+// Module 02: Households / Voters / Voter Import
+//
+// Design notes (read before extending):
+// - Household is a lightweight structured record (ward/tole + free-text
+//   address). It does NOT attempt spatial matching/dedup of addresses — that
+//   needs real geocoding and the PostGIS geometry columns that are deferred to
+//   the Household GIS module. A voter can optionally link to a Household, but
+//   bulk CSV/Excel import only ever creates Voter rows (with a free-text
+//   `address` field of their own), never Households — auto-matching import
+//   rows to existing households by address text would be unreliable without
+//   that GIS work and is explicitly out of scope here.
+// - Voter dedup key is (organizationId, wardId, normalizedName, dateOfBirth) —
+//   not a national ID, since Nepal's voter roll has no single universal
+//   identifier reliably present in source data. `voterIdNumber` (the EC serial
+//   number, when present) and `citizenshipNumber` are stored for reference but
+//   are NOT unique/dedup keys. See docs/modules/02-households-voters.md.
+// - A voter import job is scoped to exactly one Ward (matches how
+//   WARD_MANAGER's operational scope already works everywhere else in this
+//   codebase) and is processed synchronously within the request — there is no
+//   job queue in this stack yet. This is fine for ward-sized files (capped at
+//   IMPORT_MAX_ROWS in voters.service.ts); a background queue is a future
+//   upgrade if files grow beyond that, not built now.
+// ---------------------------------------------------------------------------
+
+model Household {
+  id             String       @id @default(uuid())
+  organizationId String       @map("organization_id")
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  wardId         String       @map("ward_id")
+  ward           Ward         @relation(fields: [wardId], references: [id], onDelete: Restrict)
+  toleId         String?      @map("tole_id")
+  tole           Tole?        @relation(fields: [toleId], references: [id], onDelete: SetNull)
+
+  address  String
+  landmark String?
+
+  // Informal centroid for map placement, same convention as Tole.centerLat/Lng
+  // — not a substitute for the PostGIS geometry columns added in the
+  // Household GIS module.
+  centerLat Float? @map("center_lat")
+  centerLng Float? @map("center_lng")
+
+  // Real PostGIS point, kept in sync with centerLat/centerLng by the service
+  // layer (households.geo.ts syncHouseholdLocation) on every create/update —
+  // Prisma can't populate an Unsupported column itself. This is what spatial
+  // queries (nearby, within-polygon, tole boundary-check) actually query
+  // against; centerLat/centerLng above remain the plain columns the JSON API
+  // reads/writes. See docs/modules/03-household-gis.md.
+  location Unsupported("geometry(Point, 4326)")?
+
+  // The "house owner" for the map UI's family tree (Module 09). Must be a
+  // Voter whose own householdId already points at this household — set via
+  // the normal voter link (PATCH /voters/{id} with householdId), not
+  // something this field grants on its own. Nullable: most households won't
+  // bother setting one, and a household can exist with residents but no
+  // designated head yet.
+  headOfHouseholdId String? @map("head_of_household_id")
+  headOfHousehold   Voter?  @relation("HouseholdHead", fields: [headOfHouseholdId], references: [id], onDelete: SetNull)
+
+  createdById String? @map("created_by_id")
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  voters           Voter[]
+  canvassingVisits CanvassingVisit[]
+
+  @@index([organizationId])
+  @@index([wardId])
+  @@index([toleId])
+  // Declared here (not just hand-added in the migration SQL) so `prisma
+  // migrate dev` knows this index is intentional and stops proposing to drop
+  // it as drift on every subsequent migration.
+  @@index([location], type: Gist)
+  @@map("households")
+}
+
+enum Gender {
+  MALE
+  FEMALE
+  OTHER
+}
+
+enum VoterStatus {
+  ACTIVE
+  DECEASED
+  MOVED
+}
+
+// Added post-launch (Module 06): a single current classification, not a
+// history — who assessed it and when lives in the audit log like any other
+// field update, not a dedicated table. Contact history / issue tags were
+// considered for the same pass and deliberately left out; see
+// docs/modules/02-households-voters.md.
+enum VoterSupportLevel {
+  STRONG_SUPPORTER
+  LEAN_SUPPORTER
+  UNDECIDED
+  LEAN_OPPOSED
+  STRONG_OPPOSED
+  UNKNOWN
+}
+
+// Added alongside the map/family-tree work: which party a voter seems likely to back, used for
+// household-level turnout/forecasting. Same shape as VoterSupportLevel (default UNKNOWN,
+// non-null, no history beyond the audit log) — it's the same kind of field, just a different
+// axis (party identity, not lean). OUR_PARTY is a generic placeholder: there's no per-Organization
+// "our party's name" field yet to reference instead.
+enum VoterProbableParty {
+  OUR_PARTY
+  NEPALI_CONGRESS
+  CPN_UML
+  CPN_MAOIST_CENTRE
+  CPN_UNIFIED_SOCIALIST
+  RASTRIYA_SWATANTRA_PARTY
+  RASTRIYA_PRAJATANTRA_PARTY
+  JANATA_SAMAJWADI_PARTY
+  LOKTANTRIK_SAMAJWADI_PARTY
+  JANAMAT_PARTY
+  NAGARIK_UNMUKTI_PARTY
+  NEPAL_MAJDOOR_KISAN_PARTY
+  INDEPENDENT
+  OTHER
+  UNKNOWN
+}
+
+enum VoterSource {
+  MANUAL
+  IMPORT
+}
+
+model Voter {
+  id             String       @id @default(uuid())
+  organizationId String       @map("organization_id")
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  wardId         String       @map("ward_id")
+  ward           Ward         @relation(fields: [wardId], references: [id], onDelete: Restrict)
+  toleId         String?      @map("tole_id")
+  tole           Tole?        @relation(fields: [toleId], references: [id], onDelete: SetNull)
+  householdId    String?      @map("household_id")
+  household      Household?   @relation(fields: [householdId], references: [id], onDelete: SetNull)
+
+  fullName       String   @map("full_name")
+  // Lowercased, whitespace-collapsed `fullName` — see the dedup-key note above.
+  // Computed by the service layer (normalizeVoterName in voters.service.ts),
+  // never accepted directly from a client.
+  normalizedName String   @map("normalized_name")
+  dateOfBirth    DateTime @map("date_of_birth") @db.Date
+  gender         Gender?
+
+  fatherOrSpouseName String? @map("father_or_spouse_name")
+  citizenshipNumber  String? @map("citizenship_number")
+  voterIdNumber      String? @map("voter_id_number")
+  phone              String?
+  occupation         String?
+  address            String?
+
+  status            VoterStatus        @default(ACTIVE)
+  source            VoterSource        @default(MANUAL)
+  supportLevel      VoterSupportLevel  @default(UNKNOWN) @map("support_level")
+  probableVoteParty VoterProbableParty @default(UNKNOWN) @map("probable_vote_party")
+
+  importJobId     String?         @map("import_job_id")
+  importJob       VoterImportJob? @relation(fields: [importJobId], references: [id], onDelete: SetNull)
+  importRowNumber Int?            @map("import_row_number")
+
+  createdById String? @map("created_by_id")
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  contacts            VoterContact[]
+  relationshipsAsFrom VoterRelationship[] @relation("RelationshipFrom")
+  relationshipsAsTo   VoterRelationship[] @relation("RelationshipTo")
+  headOfHouseholdFor  Household[]         @relation("HouseholdHead")
+
+  // Enforces the dedup key at the DB level too (defense in depth — the
+  // service layer already checks before insert). Safe because dateOfBirth is
+  // required, so NULL-distinctness in a composite unique index isn't an issue.
+  @@unique([organizationId, wardId, normalizedName, dateOfBirth])
+  @@index([organizationId])
+  @@index([wardId])
+  @@index([toleId])
+  @@index([householdId])
+  @@index([normalizedName])
+  @@map("voters")
+}
+
+// ---------------------------------------------------------------------------
+// Module 09: Household Family Tree (map UI)
+//
+// Design notes (read before extending):
+// - Two relation types are enough to represent a full tree: SPOUSE (symmetric
+//   — one row per pair, direction is meaningless) and PARENT_OF (directional:
+//   voterId is the parent, relatedVoterId is the child). "Grandchild" isn't
+//   its own type — it falls out automatically from walking PARENT_OF edges
+//   two levels deep, so the tree can go arbitrarily deep for free.
+// - A relationship is between two Voters directly — it does NOT require
+//   either voter's `householdId` to match any particular household, and
+//   creating one does not change either voter's `householdId`. Household
+//   residency and family-tree membership are deliberately orthogonal: an
+//   adult child who has moved out (and so has a different/no `householdId`)
+//   can still appear in a parent's household's family tree. The one place
+//   residency IS enforced is `Household.headOfHouseholdId` itself — the head
+//   must already be linked to that household (see the field's own comment).
+// - Matching against the voter list is enforced by construction, not by a
+//   special check here: relationships can only ever point at
+//   already-existing Voter rows (both sides are real foreign keys) — there
+//   is no "create a new voter inline while adding a family member" path
+//   anywhere in this module, by design.
+// - No cycle detection on PARENT_OF. A human building a tree through the UI
+//   is exceedingly unlikely to create one (there's no "search all
+//   descendants" step to trip over one), and detecting cycles properly would
+//   need a graph walk on every write. Flagged here as a known gap, not
+//   silently ignored.
+// ---------------------------------------------------------------------------
+
+enum FamilyRelationType {
+  SPOUSE
+  PARENT_OF
+}
+
+model VoterRelationship {
+  id             String       @id @default(uuid())
+  organizationId String       @map("organization_id")
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  voterId        String @map("voter_id")
+  voter          Voter  @relation("RelationshipFrom", fields: [voterId], references: [id], onDelete: Cascade)
+  relatedVoterId String @map("related_voter_id")
+  relatedVoter   Voter  @relation("RelationshipTo", fields: [relatedVoterId], references: [id], onDelete: Cascade)
+
+  type FamilyRelationType
+
+  createdById String?  @map("created_by_id")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  @@unique([voterId, relatedVoterId, type])
+  @@index([voterId])
+  @@index([relatedVoterId])
+  @@map("voter_relationships")
+}
+
+// Added post-launch (Module 06, second pass — supportLevel came first, see
+// the note on VoterSupportLevel above). Append-only, same as AuditLog: no
+// update/delete endpoint, no `updatedAt` — correcting a wrong entry means
+// logging a new one, not editing history. `supportLevelObserved`, when set,
+// also updates the voter's current `Voter.supportLevel` in the same
+// transaction (voters.service.ts createContact) so the log and the current
+// classification can't drift apart, same philosophy as
+// CanvassingTask.status being recomputed from CanvassingVisit outcomes.
+enum ContactMethod {
+  DOOR_KNOCK
+  PHONE_CALL
+  TEXT_MESSAGE
+  EMAIL
+  EVENT
+  OTHER
+}
+
+enum ContactOutcome {
+  REACHED
+  NOT_REACHED
+  REFUSED
+  WRONG_CONTACT_INFO
+}
+
+model VoterContact {
+  id             String       @id @default(uuid())
+  organizationId String       @map("organization_id")
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  voterId        String       @map("voter_id")
+  voter          Voter        @relation(fields: [voterId], references: [id], onDelete: Cascade)
+
+  method               ContactMethod
+  outcome              ContactOutcome
+  supportLevelObserved VoterSupportLevel? @map("support_level_observed")
+  notes                String?
+  contactedAt          DateTime           @default(now()) @map("contacted_at")
+
+  contactedById String @map("contacted_by_id")
+  contactedBy   User   @relation("VoterContactedBy", fields: [contactedById], references: [id], onDelete: Restrict)
+
+  // Optional provenance link if this contact happened as part of a
+  // Canvassing Task (Module 04) household visit — connects voter-level
+  // engagement back to the field-ops record that produced it.
+  canvassingVisitId String?          @map("canvassing_visit_id")
+  canvassingVisit   CanvassingVisit? @relation(fields: [canvassingVisitId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([organizationId])
+  @@index([voterId])
+  @@index([contactedById])
+  @@index([canvassingVisitId])
+  @@map("voter_contacts")
+}
+
+enum ImportJobStatus {
+  PROCESSING
+  COMPLETED
+  COMPLETED_WITH_ERRORS
+  FAILED
+}
+
+model VoterImportJob {
+  id             String       @id @default(uuid())
+  organizationId String       @map("organization_id")
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  wardId         String       @map("ward_id")
+  ward           Ward         @relation(fields: [wardId], references: [id], onDelete: Restrict)
+  toleId         String?      @map("tole_id")
+  tole           Tole?        @relation(fields: [toleId], references: [id], onDelete: SetNull)
+
+  fileName      String @map("file_name")
+  fileSizeBytes Int    @map("file_size_bytes")
+
+  status        ImportJobStatus @default(PROCESSING)
+  totalRows     Int             @default(0) @map("total_rows")
+  importedRows  Int             @default(0) @map("imported_rows")
+  duplicateRows Int             @default(0) @map("duplicate_rows")
+  errorRows     Int             @default(0) @map("error_rows")
+
+  uploadedById String @map("uploaded_by_id")
+  uploadedBy   User   @relation(fields: [uploadedById], references: [id], onDelete: Restrict)
+
+  startedAt   DateTime  @default(now()) @map("started_at")
+  completedAt DateTime? @map("completed_at")
+
+  voters Voter[]
+  issues VoterImportRowIssue[]
+
+  @@index([organizationId])
+  @@index([wardId])
+  @@map("voter_import_jobs")
+}
+
+enum ImportRowIssueType {
+  VALIDATION_ERROR
+  DUPLICATE
+}
+
+model VoterImportRowIssue {
+  id          String         @id @default(uuid())
+  importJobId String         @map("import_job_id")
+  importJob   VoterImportJob @relation(fields: [importJobId], references: [id], onDelete: Cascade)
+
+  rowNumber Int
+  issueType ImportRowIssueType @map("issue_type")
+  message   String
+  rawData   Json               @map("raw_data")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([importJobId])
+  @@map("voter_import_row_issues")
+}
+
+// ---------------------------------------------------------------------------
+// Module 04: Canvassing Tasks
+//
+// Design notes (read before extending):
+// - Mirrors the VoterImportJob/VoterImportRowIssue shape from Module 02: a
+//   CanvassingTask is the assignment (who, what area, due date), and a
+//   CanvassingVisit is a per-household outcome row snapshotted at task
+//   creation time. This gives clean progress tracking (COUNT visits by
+//   outcome) without a dynamic join against "all households in this tole" on
+//   every read, and without denormalized counters on CanvassingTask that
+//   could drift.
+// - A task is assigned to exactly one User (assignedToId) — no multi-assignee
+//   tasks. If a manager wants to split canvassing work across several people,
+//   they create several tasks, each covering a different household subset.
+//   This avoids shared-ownership/concurrency questions a multi-assignee task
+//   would raise (who marks it done? do all assignees see all visits?).
+// - assignedToId must be a FIELD_WORKER or VOLUNTEER (the two roles that
+//   actually do door-to-door work) and must already have a UserGeoAssignment
+//   covering the task's ward/tole — assigning a task doesn't grant geo
+//   access, it requires it already exists (same
+//   assign-then-check-not-check-then-grant relationship as everywhere else
+//   UserGeoAssignment is used).
+// - Visit outcomes are household-level (visited/not-home/refused/invalid
+//   address), not voter-level. Recording who specifically was spoken to and
+//   their support level is voter engagement/canvassing-results scope — a
+//   separate, not-yet-built module — kept out of this one deliberately.
+// ---------------------------------------------------------------------------
+
+enum TaskStatus {
+  PENDING
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+model CanvassingTask {
+  id             String       @id @default(uuid())
+  organizationId String       @map("organization_id")
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  wardId         String       @map("ward_id")
+  ward           Ward         @relation(fields: [wardId], references: [id], onDelete: Restrict)
+  toleId         String?      @map("tole_id")
+  tole           Tole?        @relation(fields: [toleId], references: [id], onDelete: SetNull)
+
+  title       String
+  description String?
+  status      TaskStatus @default(PENDING)
+  dueDate     DateTime?  @map("due_date") @db.Date
+
+  assignedToId String @map("assigned_to_id")
+  assignedTo   User   @relation("TaskAssignedTo", fields: [assignedToId], references: [id], onDelete: Restrict)
+
+  createdById String? @map("created_by_id")
+  createdBy   User?   @relation("TaskCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  visits CanvassingVisit[]
+
+  @@index([organizationId])
+  @@index([wardId])
+  @@index([toleId])
+  @@index([assignedToId])
+  @@map("canvassing_tasks")
+}
+
+enum VisitOutcome {
+  PENDING // not yet attempted
+  VISITED
+  NOT_HOME
+  REFUSED
+  INVALID_ADDRESS
+}
+
+model CanvassingVisit {
+  id          String         @id @default(uuid())
+  taskId      String         @map("task_id")
+  task        CanvassingTask @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  householdId String         @map("household_id")
+  household   Household      @relation(fields: [householdId], references: [id], onDelete: Cascade)
+
+  outcome   VisitOutcome @default(PENDING)
+  notes     String?
+  visitedAt DateTime?    @map("visited_at")
+
+  visitedById String? @map("visited_by_id")
+  visitedBy   User?   @relation("VisitRecordedBy", fields: [visitedById], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  voterContacts VoterContact[]
+
+  // One visit row per household per task — re-running "create task" style
+  // household selection never duplicates an existing target.
+  @@unique([taskId, householdId])
+  @@index([taskId])
+  @@index([householdId])
+  @@map("canvassing_visits")
+}
+
+// ---------------------------------------------------------------------------
+// Audit log (cross-cutting; every module writes here)
+// ---------------------------------------------------------------------------
+
+model AuditLog {
+  id             String  @id @default(uuid())
+  organizationId String? @map("organization_id")
+  actorUserId    String? @map("actor_user_id")
+  actor          User?   @relation(fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  action     String // e.g. "user.create", "ward.update", "auth.login"
+  entityType String  @map("entity_type") // e.g. "User", "Ward"
+  entityId   String? @map("entity_id")
+
+  before Json?
+  after  Json?
+
+  ipAddress String? @map("ip_address")
+  userAgent String? @map("user_agent")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([organizationId])
+  @@index([actorUserId])
+  @@index([entityType, entityId])
+  @@index([createdAt])
+  @@map("audit_logs")
+}

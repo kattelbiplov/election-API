@@ -1,0 +1,25 @@
+services:
+  postgres:
+    image: postgis/postgis:16-3.4
+    container_name: election-platform-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: election
+      POSTGRES_PASSWORD: election_dev_password
+      POSTGRES_DB: election_platform
+    ports:
+      # Host port 5435 — 5432 is often taken by a native Postgres install
+      # (macOS routes localhost:5432 to that ahead of Docker's proxy,
+      # silently connecting to the wrong database), and 5433/5434 were
+      # already in use by other local projects on this machine.
+      - '5435:5432'
+    volumes:
+      - election_platform_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U election -d election_platform']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  election_platform_pgdata:

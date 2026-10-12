@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Household Map</title>
+    <link rel="stylesheet" href="/map/vendor/leaflet/leaflet.css" />
+    <link rel="stylesheet" href="/map/style.css" />
+  </head>
+  <body>
+    <!-- Login screen -->
+    <div id="login-screen" class="screen">
+      <form id="login-form" class="login-card">
+        <h1>Household Map</h1>
+        <p class="hint">Sign in with your Election Platform account.</p>
+        <label>
+          Email
+          <input type="email" id="login-email" required autocomplete="username" />
+        </label>
+        <label>
+          Password
+          <input type="password" id="login-password" required autocomplete="current-password" />
+        </label>
+        <p id="login-error" class="error" hidden></p>
+        <button type="submit">Sign in</button>
+      </form>
+    </div>
+
+    <!-- Map app -->
+    <div id="app-screen" class="screen" hidden>
+      <header class="topbar">
+        <div class="topbar-title">Household Map</div>
+        <div class="topbar-controls">
+          <label class="ward-select">
+            Ward
+            <select id="ward-filter"></select>
+          </label>
+          <button id="add-mode-btn" type="button" class="btn-primary">+ Add household</button>
+          <span id="whoami" class="whoami"></span>
+          <button id="logout-btn" type="button" class="btn-link">Log out</button>
+        </div>
+      </header>
+
+      <div id="add-mode-banner" class="add-mode-banner" hidden>
+        Click anywhere on the map to place a new household pin — Esc to cancel.
+      </div>
+
+      <div id="map"></div>
+
+      <!-- Household create/edit panel -->
+      <aside id="household-panel" class="panel" hidden>
+        <div class="panel-header">
+          <h2 id="panel-title">New household</h2>
+          <button id="panel-close" type="button" class="btn-icon" aria-label="Close">&times;</button>
+        </div>
+        <form id="household-form">
+          <label>
+            Address*
+            <input type="text" id="field-address" required maxlength="250" />
+          </label>
+          <label>
+            Landmark
+            <input type="text" id="field-landmark" maxlength="150" />
+          </label>
+          <label>
+            Ward*
+            <select id="field-ward" required></select>
+          </label>
+          <label>
+            Tole
+            <select id="field-tole">
+              <option value="">— none —</option>
+            </select>
+          </label>
+          <div class="coords-row">
+            <span id="field-coords">lat, lng</span>
+          </div>
+          <p id="form-error" class="error" hidden></p>
+          <div class="panel-actions">
+            <button type="submit" id="save-btn" class="btn-primary">Save</button>
+            <button type="button" id="delete-btn" class="btn-danger" hidden>Delete</button>
+          </div>
+        </form>
+        <button type="button" id="manage-family-btn" class="btn-link family-link" hidden>
+          &#128110; Manage family &amp; owner
+        </button>
+      </aside>
+
+      <!-- Family tree modal — matched against the voter list: every person
+           here is an existing Voter, searched and linked, never typed in
+           free-text (see docs/modules/09-household-family-tree.md). -->
+      <div id="family-modal-backdrop" class="modal-backdrop" hidden>
+        <div id="family-modal" class="modal">
+          <div class="panel-header">
+            <h2>Family — <span id="family-modal-address"></span></h2>
+            <button id="family-modal-close" type="button" class="btn-icon" aria-label="Close">&times;</button>
+          </div>
+
+          <section class="family-section">
+            <label>
+              House owner
+              <select id="family-owner-select">
+                <option value="">— none —</option>
+              </select>
+            </label>
+            <p class="hint" id="family-member-count"></p>
+          </section>
+
+          <section class="family-section">
+            <h3>Residents linked to this household</h3>
+            <ul id="family-residents-list" class="plain-list"></ul>
+
+            <div class="family-link-search">
+              <input type="text" id="family-link-search-input" placeholder="Search voters by name to link…" autocomplete="off" />
+              <ul id="family-link-search-results" class="plain-list search-results"></ul>
+            </div>
+          </section>
+
+          <section class="family-section">
+            <h3>Add a relationship</h3>
+            <div class="relationship-form">
+              <select id="relationship-from"></select>
+              <select id="relationship-type">
+                <option value="SPOUSE">is the spouse of</option>
+                <option value="PARENT_OF">is the parent of</option>
+              </select>
+              <select id="relationship-to"></select>
+              <button type="button" id="relationship-add-btn" class="btn-primary">Add</button>
+            </div>
+            <p id="relationship-error" class="error" hidden></p>
+          </section>
+
+          <section class="family-section">
+            <h3>Family tree</h3>
+            <div id="family-tree-container"></div>
+          </section>
+        </div>
+      </div>
+    </div>
+
+    <script src="/map/vendor/leaflet/leaflet.js"></script>
+    <script src="/map/app.js"></script>
+  </body>
+</html>

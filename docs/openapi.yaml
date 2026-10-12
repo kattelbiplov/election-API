@@ -1,0 +1,2045 @@
+openapi: 3.0.3
+info:
+  title: Election Operations & Voter Intelligence Platform API
+  description: |
+    Backend API for Nepal local-level election campaign operations.
+
+    ## Response envelope
+    Every response is one of:
+    - Success (single item): `{ "success": true, "data": <object> }`
+    - Success (list): `{ "success": true, "data": [<object>...], "pagination": { page, pageSize, totalItems, totalPages } }`
+    - Error: `{ "success": false, "error": { "code": "...", "message": "...", "details"?: ... }, "requestId": "..." }`
+
+    ## Auth
+    All endpoints except `POST /auth/login`, `POST /auth/refresh`, `POST /auth/logout`, and
+    `GET /health` require `Authorization: Bearer <accessToken>`. Access tokens expire in ~15
+    minutes; use `POST /auth/refresh` with the refresh token to get a new pair. Refresh tokens
+    rotate on every use — always store the *latest* refreshToken returned.
+
+    ## Multi-tenancy
+    Every authenticated user belongs to exactly one `Organization` (a campaign). All
+    organization-scoped resources (users, toles) are implicitly filtered to the caller's
+    organization — you never pass an `organizationId` yourself. `Province`/`District`/
+    `Municipality`/`Ward` are shared, global reference data (Nepal's official administrative
+    geography), not scoped to any organization.
+
+    ## Roles
+    `SUPER_ADMIN` (platform operator) > `CAMPAIGN_ADMIN` (runs a campaign) > `WARD_MANAGER` >
+    `TOLE_COORDINATOR` > `FIELD_WORKER`, plus `ANALYST` and `VIEW_ONLY` as read-only roles.
+    See the "Permission matrix" section in `docs/modules/01-auth-rbac-geo.md` for the full
+    per-endpoint breakdown.
+  version: 0.1.0
+servers:
+  - url: http://localhost:4000/api/v1
+    description: Local development
+
+tags:
+  - name: Auth
+  - name: Organizations
+  - name: Users
+  - name: Geo
+  - name: Households
+  - name: Voters
+  - name: Canvassing Tasks
+  - name: Reports
+  - name: Audit Logs
+
+security:
+  - bearerAuth: []
+
+paths:
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Log in with email + password
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string }
+      responses:
+        '200':
+          description: Login successful
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          user: { $ref: '#/components/schemas/User' }
+                          accessToken: { type: string }
+                          refreshToken: { type: string }
+                          expiresIn: { type: string, example: 15m }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /auth/refresh:
+    post:
+      tags: [Auth]
+      summary: Exchange a refresh token for a new access/refresh pair (rotates the refresh token)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refreshToken]
+              properties:
+                refreshToken: { type: string }
+      responses:
+        '200':
+          description: New token pair
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          accessToken: { type: string }
+                          refreshToken: { type: string }
+                          expiresIn: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      summary: Revoke a refresh token (logs out the current device/session)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refreshToken]
+              properties:
+                refreshToken: { type: string }
+      responses:
+        '200': { description: Logged out }
+
+  /auth/me:
+    get:
+      tags: [Auth]
+      summary: Get the current authenticated user
+      responses:
+        '200':
+          description: Current user
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties: { data: { $ref: '#/components/schemas/User' } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /auth/change-password:
+    post:
+      tags: [Auth]
+      summary: Change the current user's password (revokes all other sessions)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [currentPassword, newPassword]
+              properties:
+                currentPassword: { type: string }
+                newPassword: { type: string, minLength: 10 }
+      responses:
+        '200': { description: Password changed }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /organizations:
+    post:
+      tags: [Organizations]
+      summary: Create a new campaign organization + its first CAMPAIGN_ADMIN (SUPER_ADMIN only)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, slug, adminName, adminEmail, adminPassword]
+              properties:
+                name: { type: string }
+                slug: { type: string, description: "lowercase-kebab-case, unique" }
+                adminName: { type: string }
+                adminEmail: { type: string, format: email }
+                adminPassword: { type: string, minLength: 10 }
+      responses:
+        '201':
+          description: Organization + admin created
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          organization: { $ref: '#/components/schemas/Organization' }
+                          admin: { $ref: '#/components/schemas/User' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+    get:
+      tags: [Organizations]
+      summary: List organizations (SUPER_ADMIN only)
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+        - name: search
+          in: query
+          schema: { type: string }
+      responses:
+        '200': { $ref: '#/components/responses/PaginatedOrganizations' }
+
+  /organizations/{id}:
+    parameters:
+      - $ref: '#/components/parameters/IdParam'
+    get:
+      tags: [Organizations]
+      summary: Get an organization (SUPER_ADMIN, or CAMPAIGN_ADMIN for their own org)
+      responses:
+        '200':
+          description: Organization
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties: { data: { $ref: '#/components/schemas/Organization' } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Organizations]
+      summary: Update an organization (name — CAMPAIGN_ADMIN on own org; status — SUPER_ADMIN only)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                status: { type: string, enum: [ACTIVE, SUSPENDED] }
+      responses:
+        '200':
+          description: Updated organization
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties: { data: { $ref: '#/components/schemas/Organization' } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /users:
+    post:
+      tags: [Users]
+      summary: Create a user in the caller's organization
+      description: Requires `users:create` (CAMPAIGN_ADMIN+). Only SUPER_ADMIN may set role=SUPER_ADMIN.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, email, password, role]
+              properties:
+                name: { type: string }
+                email: { type: string, format: email }
+                phone: { type: string }
+                password: { type: string, minLength: 10 }
+                role: { $ref: '#/components/schemas/UserRole' }
+                address: { type: string }
+                dateOfBirth: { type: string, format: date }
+                gender: { $ref: '#/components/schemas/Gender' }
+      responses:
+        '201':
+          description: Created user
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties: { data: { $ref: '#/components/schemas/User' } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+    get:
+      tags: [Users]
+      summary: List users in the caller's organization
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+        - name: role
+          in: query
+          schema: { $ref: '#/components/schemas/UserRole' }
+        - name: status
+          in: query
+          schema: { type: string, enum: [ACTIVE, SUSPENDED, INVITED] }
+        - name: search
+          in: query
+          schema: { type: string }
+        - name: wardId
+          in: query
+          schema: { type: string, format: uuid }
+          description: Filter to users assigned to this ward
+      responses:
+        '200': { $ref: '#/components/responses/PaginatedUsers' }
+
+  /users/{id}:
+    parameters:
+      - $ref: '#/components/parameters/IdParam'
+    get:
+      tags: [Users]
+      summary: Get a user by id
+      responses:
+        '200':
+          description: User
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties: { data: { $ref: '#/components/schemas/User' } }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Users]
+      summary: Update a user (name, phone, role, status, bio fields)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                phone: { type: string, nullable: true }
+                role: { $ref: '#/components/schemas/UserRole' }
+                status: { type: string, enum: [ACTIVE, SUSPENDED, INVITED] }
+                address: { type: string, nullable: true }
+                dateOfBirth: { type: string, format: date, nullable: true }
+                gender: { allOf: [{ $ref: '#/components/schemas/Gender' }], nullable: true }
+      responses:
+        '200':
+          description: Updated user
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties: { data: { $ref: '#/components/schemas/User' } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    delete:
+      tags: [Users]
+      summary: Deactivate a user (soft delete — cannot deactivate self or, unless SUPER_ADMIN, another SUPER_ADMIN)
+      responses:
+        '200': { description: User deactivated }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /users/{id}/assignments:
+    parameters:
+      - $ref: '#/components/parameters/IdParam'
+    post:
+      tags: [Users]
+      summary: Assign a user to a ward (and optionally a tole within it)
+      description: |
+        Grants WARD_MANAGER/TOLE_COORDINATOR/FIELD_WORKER access to that geography.
+        Idempotent — assigning the same (ward, tole) pair twice is a no-op.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [wardId]
+              properties:
+                wardId: { type: string, format: uuid }
+                toleId: { type: string, format: uuid, description: Must belong to wardId }
+      responses:
+        '201':
+          description: Assignment created
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties: { data: { $ref: '#/components/schemas/UserGeoAssignment' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /users/{id}/assignments/{assignmentId}:
+    delete:
+      tags: [Users]
+      summary: Remove a geo assignment from a user
+      parameters:
+        - $ref: '#/components/parameters/IdParam'
+        - name: assignmentId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200': { description: Assignment removed }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /provinces:
+    get:
+      tags: [Geo]
+      summary: List all provinces
+      responses:
+        '200':
+          description: Provinces
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties: { data: { type: array, items: { $ref: '#/components/schemas/Province' } } }
+    post:
+      tags: [Geo]
+      summary: Create a province (SUPER_ADMIN only — official reference data)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code, name]
+              properties:
+                code: { type: integer }
+                name: { type: string }
+                nameNepali: { type: string }
+      responses:
+        '201': { description: Created }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /provinces/{id}:
+    parameters: [{ $ref: '#/components/parameters/IdParam' }]
+    get:
+      tags: [Geo]
+      summary: Get a province
+      responses:
+        '200': { description: Province }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Geo]
+      summary: Update a province (SUPER_ADMIN only)
+      responses:
+        '200': { description: Updated }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /districts:
+    get:
+      tags: [Geo]
+      summary: List districts
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+        - name: provinceId
+          in: query
+          schema: { type: string, format: uuid }
+      responses:
+        '200': { description: Paginated districts }
+    post:
+      tags: [Geo]
+      summary: Create a district (SUPER_ADMIN only)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [provinceId, code, name]
+              properties:
+                provinceId: { type: string, format: uuid }
+                code: { type: string }
+                name: { type: string }
+                nameNepali: { type: string }
+      responses:
+        '201': { description: Created }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /districts/{id}:
+    parameters: [{ $ref: '#/components/parameters/IdParam' }]
+    get:
+      tags: [Geo]
+      summary: Get a district
+      responses:
+        '200': { description: District }
+    patch:
+      tags: [Geo]
+      summary: Update a district (SUPER_ADMIN only)
+      responses:
+        '200': { description: Updated }
+
+  /municipalities:
+    get:
+      tags: [Geo]
+      summary: List municipalities (local levels)
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+        - name: districtId
+          in: query
+          schema: { type: string, format: uuid }
+        - name: search
+          in: query
+          schema: { type: string }
+      responses:
+        '200': { description: Paginated municipalities }
+    post:
+      tags: [Geo]
+      summary: Create a municipality (SUPER_ADMIN only)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [districtId, code, name, type, totalWards]
+              properties:
+                districtId: { type: string, format: uuid }
+                code: { type: string }
+                name: { type: string }
+                nameNepali: { type: string }
+                type: { $ref: '#/components/schemas/MunicipalityType' }
+                totalWards: { type: integer }
+      responses:
+        '201': { description: Created }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /municipalities/{id}:
+    parameters: [{ $ref: '#/components/parameters/IdParam' }]
+    get:
+      tags: [Geo]
+      summary: Get a municipality
+      responses:
+        '200': { description: Municipality }
+    patch:
+      tags: [Geo]
+      summary: Update a municipality (SUPER_ADMIN only)
+      responses:
+        '200': { description: Updated }
+
+  /wards:
+    get:
+      tags: [Geo]
+      summary: List wards
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+        - name: municipalityId
+          in: query
+          schema: { type: string, format: uuid }
+      responses:
+        '200': { description: Paginated wards }
+    post:
+      tags: [Geo]
+      summary: Create a ward (SUPER_ADMIN, CAMPAIGN_ADMIN)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [municipalityId, wardNumber]
+              properties:
+                municipalityId: { type: string, format: uuid }
+                wardNumber: { type: integer }
+                name: { type: string }
+                population: { type: integer }
+      responses:
+        '201': { description: Created }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /wards/{id}:
+    parameters: [{ $ref: '#/components/parameters/IdParam' }]
+    get:
+      tags: [Geo]
+      summary: Get a ward
+      responses:
+        '200': { description: Ward }
+    patch:
+      tags: [Geo]
+      summary: Update a ward (SUPER_ADMIN, CAMPAIGN_ADMIN)
+      responses:
+        '200': { description: Updated }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /toles:
+    get:
+      tags: [Geo]
+      summary: List toles in the caller's organization
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+        - name: wardId
+          in: query
+          schema: { type: string, format: uuid }
+        - name: search
+          in: query
+          schema: { type: string }
+      responses:
+        '200': { description: Paginated toles }
+    post:
+      tags: [Geo]
+      summary: Create a tole (informal sub-ward area) within a ward
+      description: |
+        Toles are organization-scoped — see the multi-tenancy note above. WARD_MANAGER can
+        only create toles inside a ward they are assigned to (checked server-side); this is
+        NOT expressed as a route-level permission, so 403 here can mean either "role lacks
+        geo:tole_create" or "not assigned to this ward".
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [wardId, name]
+              properties:
+                wardId: { type: string, format: uuid }
+                name: { type: string }
+                nameNepali: { type: string }
+                centerLat: { type: number }
+                centerLng: { type: number }
+                boundary:
+                  type: object
+                  description: Optional GeoJSON Polygon
+      responses:
+        '201': { description: Created }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /toles/{id}:
+    parameters: [{ $ref: '#/components/parameters/IdParam' }]
+    get:
+      tags: [Geo]
+      summary: Get a tole
+      responses:
+        '200': { description: Tole }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Geo]
+      summary: Update a tole
+      responses:
+        '200': { description: Updated }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    delete:
+      tags: [Geo]
+      summary: Soft-delete a tole (CAMPAIGN_ADMIN only)
+      responses:
+        '200': { description: Deleted }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /toles/{id}/boundary-check:
+    parameters: [{ $ref: '#/components/parameters/IdParam' }]
+    get:
+      tags: [Households]
+      summary: Households assigned to this tole whose location falls outside its drawn boundary
+      description: |
+        Requires `household:read` (not `geo:read`) since the result is household data, not tole
+        metadata. 400 if the tole has no `boundary` polygon set. A data-quality report — surfaces
+        geocoding mistakes or a tole boundary that was drawn/redrawn after households were
+        assigned. See `docs/modules/03-household-gis.md`.
+      responses:
+        '200':
+          description: Households outside the boundary (empty array if none)
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties: { data: { type: array, items: { $ref: '#/components/schemas/Household' } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /geo/import:
+    post:
+      tags: [Geo]
+      summary: Bulk-load the official Nepal administrative dataset (SUPER_ADMIN only)
+      description: |
+        Requires `geo:manage_national`. Upserts Province/District/Municipality by their official
+        codes and auto-creates any missing Ward rows 1..total_wards for each municipality —
+        existing wards (which may carry UserGeoAssignments/households) are never deleted, even if
+        a re-import lowers total_wards. One row = one municipality, with its parent
+        province/district repeated alongside it; province/district appear once per file but are
+        deduplicated automatically. Processed synchronously, capped at 2000 rows / 5MB. This
+        endpoint does not embed or fabricate the actual dataset — the caller supplies a file
+        sourced from Election Commission Nepal / the National Statistics Office. Accepted columns
+        and upsert behavior: `docs/modules/05-geo-dataset-import.md`.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: .csv or .xlsx, max 5MB
+      responses:
+        '200':
+          description: Import summary (counts by outcome + per-row errors)
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties: { data: { $ref: '#/components/schemas/GeoImportSummary' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /households:
+    post:
+      tags: [Households]
+      summary: Create a household
+      description: |
+        Requires `household:create`. Scoped roles (WARD_MANAGER/TOLE_COORDINATOR/FIELD_WORKER)
+        may only create within a ward/tole they're assigned to — a mismatch is a 403, not a 400.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [wardId, address]
+              properties:
+                wardId: { type: string, format: uuid }
+                toleId: { type: string, format: uuid, description: Must belong to wardId }
+                address: { type: string }
+                landmark: { type: string }
+                centerLat: { type: number }
+                centerLng: { type: number }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties: { data: { $ref: '#/components/schemas/Household' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    get:
+      tags: [Households]
+      summary: List households
+      description: |
+        Scoped roles only see households in a ward/tole they're assigned to (unlike the Geo
+        module, household/voter reads are restricted per-assignment because this is PII, not
+        public reference data).
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+        - name: wardId
+          in: query
+          schema: { type: string, format: uuid }
+        - name: toleId
+          in: query
+          schema: { type: string, format: uuid }
+        - name: search
+          in: query
+          schema: { type: string, description: Matches against address }
+      responses:
+        '200': { $ref: '#/components/responses/PaginatedHouseholds' }
+
+  /households/nearby:
+    get:
+      tags: [Households]
+      summary: Households within a radius of a point, nearest first
+      description: |
+        Uses the household's PostGIS `location` point (kept in sync with centerLat/centerLng —
+        see `docs/modules/03-household-gis.md`); households with no coordinates are excluded.
+        `radiusMeters` is capped at 5000.
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+        - name: lat
+          in: query
+          required: true
+          schema: { type: number, minimum: -90, maximum: 90 }
+        - name: lng
+          in: query
+          required: true
+          schema: { type: number, minimum: -180, maximum: 180 }
+        - name: radiusMeters
+          in: query
+          schema: { type: number, default: 500, maximum: 5000 }
+        - name: wardId
+          in: query
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Paginated households, nearest first, each with a distanceMeters field
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PaginatedEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          allOf:
+                            - $ref: '#/components/schemas/Household'
+                            - type: object
+                              properties: { distanceMeters: { type: number } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /households/search/within-polygon:
+    post:
+      tags: [Households]
+      summary: Households whose location falls inside an arbitrary GeoJSON polygon
+      description: |
+        For ad-hoc canvassing-area queries against a polygon that isn't necessarily a saved Tole
+        boundary (for that, see `GET /toles/{id}/boundary-check`, which runs the reverse check).
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [wardId, polygon]
+              properties:
+                wardId: { type: string, format: uuid }
+                polygon:
+                  type: object
+                  description: GeoJSON Polygon
+      responses:
+        '200': { $ref: '#/components/responses/PaginatedHouseholds' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /households/{id}:
+    parameters: [{ $ref: '#/components/parameters/IdParam' }]
+    get:
+      tags: [Households]
+      summary: Get a household
+      responses:
+        '200':
+          description: Household
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties: { data: { $ref: '#/components/schemas/Household' } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Households]
+      summary: Update a household
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                toleId: { type: string, format: uuid, nullable: true }
+                address: { type: string }
+                landmark: { type: string, nullable: true }
+                centerLat: { type: number, nullable: true }
+                centerLng: { type: number, nullable: true }
+                headOfHouseholdId:
+                  type: string
+                  format: uuid
+                  nullable: true
+                  description: |
+                    Must be a Voter whose own householdId already equals this household's id
+                    (link them via PATCH /voters/{id} first) — 400 otherwise. See
+                    docs/modules/09-household-family-tree.md.
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties: { data: { $ref: '#/components/schemas/Household' } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    delete:
+      tags: [Households]
+      summary: Soft-delete a household
+      responses:
+        '200': { description: Deleted }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /households/{id}/family-tree:
+    parameters: [{ $ref: '#/components/parameters/IdParam' }]
+    get:
+      tags: [Households]
+      summary: The household's family tree, rooted at its head of household
+      description: |
+        Assembled live from VoterRelationship edges — not a stored/cached structure. Returns
+        `{headOfHousehold: null, spouse: null, children: [], totalFamilyMembers: 0}` if no head
+        of household is set yet. See `docs/modules/09-household-family-tree.md`.
+      responses:
+        '200':
+          description: Family tree
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties: { data: { $ref: '#/components/schemas/FamilyTree' } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /voters:
+    post:
+      tags: [Voters]
+      summary: Create a voter
+      description: |
+        Requires `voter:create`. Dedup is enforced on (wardId, normalizedName, dateOfBirth) —
+        creating a voter that matches an existing one on name + date of birth within the same
+        ward returns 409, not a silent merge.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [wardId, fullName, dateOfBirth]
+              properties:
+                wardId: { type: string, format: uuid }
+                toleId: { type: string, format: uuid }
+                householdId: { type: string, format: uuid }
+                fullName: { type: string }
+                dateOfBirth: { type: string, format: date }
+                gender: { $ref: '#/components/schemas/Gender' }
+                fatherOrSpouseName: { type: string }
+                citizenshipNumber: { type: string }
+                voterIdNumber: { type: string, description: EC-issued voter serial number, if known }
+                phone: { type: string }
+                occupation: { type: string }
+                address: { type: string }
+                supportLevel: { $ref: '#/components/schemas/VoterSupportLevel' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties: { data: { $ref: '#/components/schemas/Voter' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+    get:
+      tags: [Voters]
+      summary: List voters
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+        - name: wardId
+          in: query
+          schema: { type: string, format: uuid }
+        - name: toleId
+          in: query
+          schema: { type: string, format: uuid }
+        - name: householdId
+          in: query
+          schema: { type: string, format: uuid }
+        - name: gender
+          in: query
+          schema: { $ref: '#/components/schemas/Gender' }
+        - name: status
+          in: query
+          schema: { type: string, enum: [ACTIVE, DECEASED, MOVED] }
+        - name: supportLevel
+          in: query
+          schema: { $ref: '#/components/schemas/VoterSupportLevel' }
+        - name: search
+          in: query
+          schema: { type: string, description: Matches against fullName }
+      responses:
+        '200': { $ref: '#/components/responses/PaginatedVoters' }
+
+  /voters/import:
+    post:
+      tags: [Voters]
+      summary: Bulk-import voters for one ward from a CSV/Excel file
+      description: |
+        Requires `voter:import` (CAMPAIGN_ADMIN, WARD_MANAGER — ward-scoped for WARD_MANAGER
+        like every other write in this ward). Processed synchronously in the request (no job
+        queue yet) — expect the response to take longer for larger files, capped at 10,000 rows
+        and 10MB. Accepted columns and dedup behavior are documented in
+        `docs/modules/02-households-voters.md`.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [wardId, file]
+              properties:
+                wardId: { type: string, format: uuid }
+                toleId:
+                  type: string
+                  format: uuid
+                  description: Default tole for rows without a tole_name column
+                file:
+                  type: string
+                  format: binary
+                  description: .csv or .xlsx, max 10MB
+      responses:
+        '201':
+          description: Import job finished (synchronously) — see counts for outcome
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties: { data: { $ref: '#/components/schemas/VoterImportJob' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /voters/import-jobs:
+    get:
+      tags: [Voters]
+      summary: List voter import jobs
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+        - name: wardId
+          in: query
+          schema: { type: string, format: uuid }
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/ImportJobStatus' }
+      responses:
+        '200': { $ref: '#/components/responses/PaginatedImportJobs' }
+
+  /voters/import-jobs/{id}:
+    parameters: [{ $ref: '#/components/parameters/IdParam' }]
+    get:
+      tags: [Voters]
+      summary: Get an import job (row counts by outcome)
+      responses:
+        '200':
+          description: Import job
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties: { data: { $ref: '#/components/schemas/VoterImportJob' } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /voters/import-jobs/{id}/issues:
+    parameters: [{ $ref: '#/components/parameters/IdParam' }]
+    get:
+      tags: [Voters]
+      summary: List per-row validation errors and duplicates for an import job
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+        - name: issueType
+          in: query
+          schema: { type: string, enum: [VALIDATION_ERROR, DUPLICATE] }
+      responses:
+        '200': { $ref: '#/components/responses/PaginatedImportIssues' }
+
+  /voters/{id}:
+    parameters: [{ $ref: '#/components/parameters/IdParam' }]
+    get:
+      tags: [Voters]
+      summary: Get a voter
+      responses:
+        '200':
+          description: Voter
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties: { data: { $ref: '#/components/schemas/Voter' } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Voters]
+      summary: Update a voter
+      description: Changing fullName/dateOfBirth re-checks the dedup key and 409s on a clash.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                toleId: { type: string, format: uuid, nullable: true }
+                householdId: { type: string, format: uuid, nullable: true }
+                fullName: { type: string }
+                dateOfBirth: { type: string, format: date }
+                gender: { $ref: '#/components/schemas/Gender' }
+                fatherOrSpouseName: { type: string, nullable: true }
+                citizenshipNumber: { type: string, nullable: true }
+                voterIdNumber: { type: string, nullable: true }
+                phone: { type: string, nullable: true }
+                occupation: { type: string, nullable: true }
+                address: { type: string, nullable: true }
+                status: { type: string, enum: [ACTIVE, DECEASED, MOVED] }
+                supportLevel: { $ref: '#/components/schemas/VoterSupportLevel' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties: { data: { $ref: '#/components/schemas/Voter' } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+    delete:
+      tags: [Voters]
+      summary: Soft-delete a voter (removes from the roll — for a data-entry error, not a status change)
+      description: To mark a voter deceased/moved without removing the record, PATCH `status` instead.
+      responses:
+        '200': { description: Deleted }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /voters/{id}/contacts:
+    parameters: [{ $ref: '#/components/parameters/IdParam' }]
+    post:
+      tags: [Voters]
+      summary: Log a contact attempt with a voter
+      description: |
+        Requires `voter:update` (logging a contact is part of recording what's known about a
+        voter, same tier as editing their record). Append-only — there is no update/delete
+        endpoint for a contact; correcting a wrong entry means logging a new one, same as the
+        audit log. If `supportLevelObserved` is set, it also overwrites the voter's current
+        `supportLevel` in the same transaction, so the log and the current classification can't
+        drift apart. `canvassingVisitId` is optional provenance linking this contact to a
+        Canvassing Task (Module 04) household visit — if given, that visit's household must match
+        the voter's `householdId` (400 otherwise). See `docs/modules/02-households-voters.md`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [method, outcome]
+              properties:
+                method: { $ref: '#/components/schemas/ContactMethod' }
+                outcome: { $ref: '#/components/schemas/ContactOutcome' }
+                supportLevelObserved: { $ref: '#/components/schemas/VoterSupportLevel' }
+                notes: { type: string }
+                contactedAt: { type: string, format: date-time, description: Defaults to now; cannot be in the future }
+                canvassingVisitId: { type: string, format: uuid }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties: { data: { $ref: '#/components/schemas/VoterContact' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    get:
+      tags: [Voters]
+      summary: List a voter's contact history, most recent first
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+        - name: method
+          in: query
+          schema: { $ref: '#/components/schemas/ContactMethod' }
+        - name: outcome
+          in: query
+          schema: { $ref: '#/components/schemas/ContactOutcome' }
+      responses:
+        '200': { $ref: '#/components/responses/PaginatedContacts' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /voters/{id}/relationships:
+    parameters: [{ $ref: '#/components/parameters/IdParam' }]
+    post:
+      tags: [Voters]
+      summary: Add a family relationship (spouse or parent-of) between two voters
+      description: |
+        Requires `voter:update`. `relatedVoterId` must already be a real Voter — there is no
+        "create a new voter inline" path here; both sides must be matched against the existing
+        voter list first (see `docs/modules/09-household-family-tree.md`). `SPOUSE` is symmetric
+        (order doesn't matter); `PARENT_OF` is directional — `{id}` is the parent,
+        `relatedVoterId` is the child. 409 if the exact relationship already exists, 400 for a
+        self-relationship.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [relatedVoterId, type]
+              properties:
+                relatedVoterId: { type: string, format: uuid }
+                type: { $ref: '#/components/schemas/FamilyRelationType' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties: { data: { $ref: '#/components/schemas/VoterRelationship' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+    get:
+      tags: [Voters]
+      summary: List a voter's direct family relationships (not the full tree)
+      description: |
+        Each entry is normalized to `otherVoter` (whichever side of the stored row isn't `{id}`)
+        plus `direction` (`FORWARD` if `{id}` is the `voterId` side, `INVERSE` otherwise) — callers
+        don't need to know which side a relationship happened to be stored on. For a full
+        multi-generation tree rooted at a household's head, use
+        `GET /households/{id}/family-tree` instead.
+      responses:
+        '200':
+          description: Relationships
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            id: { type: string, format: uuid }
+                            type: { $ref: '#/components/schemas/FamilyRelationType' }
+                            otherVoter: { $ref: '#/components/schemas/VoterSummary' }
+                            direction: { type: string, enum: [FORWARD, INVERSE] }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /voters/{id}/relationships/{relationshipId}:
+    parameters:
+      - $ref: '#/components/parameters/IdParam'
+      - name: relationshipId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    delete:
+      tags: [Voters]
+      summary: Remove a family relationship
+      responses:
+        '200': { description: Deleted }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /canvassing-tasks:
+    post:
+      tags: [Canvassing Tasks]
+      summary: Create a canvassing task and assign it to a FIELD_WORKER/VOLUNTEER
+      description: |
+        Requires `task:create`. The assignee must already have a UserGeoAssignment covering
+        `wardId`/`toleId` (assigning a task requires that access exist, it doesn't grant it) and
+        must be an active FIELD_WORKER or VOLUNTEER. If `householdIds` is omitted, the task covers
+        every household currently in `toleId` (or all of `wardId` if `toleId` is omitted too) —
+        snapshotted into per-household visit rows at creation time, capped at 500 households.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [wardId, title, assignedToId]
+              properties:
+                wardId: { type: string, format: uuid }
+                toleId: { type: string, format: uuid }
+                title: { type: string }
+                description: { type: string }
+                dueDate: { type: string, format: date }
+                assignedToId: { type: string, format: uuid }
+                householdIds:
+                  type: array
+                  items: { type: string, format: uuid }
+                  description: Explicit household list; omit to auto-select all households in toleId/wardId
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties: { data: { $ref: '#/components/schemas/CanvassingTask' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    get:
+      tags: [Canvassing Tasks]
+      summary: List canvassing tasks
+      description: |
+        FIELD_WORKER/VOLUNTEER always see only their own assigned tasks — `assignedToId` is
+        ignored (not merely defaulted) for those roles, so they can't browse a colleague's queue.
+        Every other role is geo-scoped the same way households/voters are.
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+        - name: wardId
+          in: query
+          schema: { type: string, format: uuid }
+        - name: toleId
+          in: query
+          schema: { type: string, format: uuid }
+        - name: assignedToId
+          in: query
+          schema: { type: string, format: uuid }
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/TaskStatus' }
+      responses:
+        '200': { $ref: '#/components/responses/PaginatedTasks' }
+
+  /canvassing-tasks/{id}:
+    parameters: [{ $ref: '#/components/parameters/IdParam' }]
+    get:
+      tags: [Canvassing Tasks]
+      summary: Get a task (includes a visitSummary of outcome counts)
+      responses:
+        '200':
+          description: Task
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties: { data: { $ref: '#/components/schemas/CanvassingTask' } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [Canvassing Tasks]
+      summary: Update a task (reassign, reschedule, cancel)
+      description: |
+        `status` can be set directly (e.g. to CANCELLED), but PENDING/IN_PROGRESS/COMPLETED are
+        normally derived automatically from visit outcomes — see `PATCH .../visits/{visitId}`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                title: { type: string }
+                description: { type: string, nullable: true }
+                dueDate: { type: string, format: date, nullable: true }
+                assignedToId: { type: string, format: uuid }
+                status: { $ref: '#/components/schemas/TaskStatus' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties: { data: { $ref: '#/components/schemas/CanvassingTask' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    delete:
+      tags: [Canvassing Tasks]
+      summary: Soft-delete a task
+      responses:
+        '200': { description: Deleted }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /canvassing-tasks/{id}/visits:
+    parameters: [{ $ref: '#/components/parameters/IdParam' }]
+    get:
+      tags: [Canvassing Tasks]
+      summary: List a task's per-household visit records
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+        - name: outcome
+          in: query
+          schema: { $ref: '#/components/schemas/VisitOutcome' }
+      responses:
+        '200': { $ref: '#/components/responses/PaginatedVisits' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /canvassing-tasks/{id}/visits/{visitId}:
+    parameters:
+      - $ref: '#/components/parameters/IdParam'
+      - name: visitId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    patch:
+      tags: [Canvassing Tasks]
+      summary: Record the outcome of visiting one household in a task
+      description: |
+        Requires `task:visit_update`. Setting any outcome other than PENDING stamps `visitedAt`
+        (now) and `visitedById` (the caller); setting it back to PENDING clears `visitedAt`. The
+        parent task's `status` is recomputed immediately after — see `POST /canvassing-tasks`.
+        400s if the task is CANCELLED.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [outcome]
+              properties:
+                outcome: { $ref: '#/components/schemas/VisitOutcome' }
+                notes: { type: string }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties: { data: { $ref: '#/components/schemas/CanvassingVisit' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /reports/dashboard:
+    get:
+      tags: [Reports]
+      summary: Aggregate counts across households, voters, canvassing, and contacts
+      description: |
+        Requires `report:read` (CAMPAIGN_ADMIN, WARD_MANAGER, TOLE_COORDINATOR, ANALYST,
+        VIEW_ONLY — not FIELD_WORKER/VOLUNTEER, who have no use for campaign-wide analytics).
+        Geo-scoped the same way household/voter lists are: a WARD_MANAGER/TOLE_COORDINATOR always
+        sees only their own assigned ward/tole, and passing a `wardId`/`toleId` outside that scope
+        returns all-zero counts rather than a 403 — same "out-of-scope filter yields nothing"
+        behavior as everywhere else in this codebase, not an error. No new entities — everything
+        here is aggregated live from data owned by earlier modules. See
+        `docs/modules/07-reporting-analytics.md`.
+      parameters:
+        - name: wardId
+          in: query
+          schema: { type: string, format: uuid }
+        - name: toleId
+          in: query
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Dashboard summary
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties: { data: { $ref: '#/components/schemas/DashboardSummary' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /audit-logs:
+    get:
+      tags: [Audit Logs]
+      summary: List audit logs (SUPER_ADMIN sees platform-wide; others see their own organization)
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+        - name: entityType
+          in: query
+          schema: { type: string }
+          example: User
+        - name: entityId
+          in: query
+          schema: { type: string, format: uuid }
+        - name: actorUserId
+          in: query
+          schema: { type: string, format: uuid }
+        - name: action
+          in: query
+          schema: { type: string }
+          example: user.update
+        - name: from
+          in: query
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          schema: { type: string, format: date-time }
+      responses:
+        '200': { description: Paginated audit logs }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    IdParam:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    Page:
+      name: page
+      in: query
+      schema: { type: integer, default: 1, minimum: 1 }
+    PageSize:
+      name: pageSize
+      in: query
+      schema: { type: integer, default: 25, minimum: 1, maximum: 200 }
+
+  responses:
+    BadRequest:
+      description: Validation error
+      content:
+        application/json: { schema: { $ref: '#/components/schemas/ErrorEnvelope' } }
+    Unauthorized:
+      description: Missing/invalid/expired credentials
+      content:
+        application/json: { schema: { $ref: '#/components/schemas/ErrorEnvelope' } }
+    Forbidden:
+      description: Authenticated but not permitted
+      content:
+        application/json: { schema: { $ref: '#/components/schemas/ErrorEnvelope' } }
+    NotFound:
+      description: Resource not found
+      content:
+        application/json: { schema: { $ref: '#/components/schemas/ErrorEnvelope' } }
+    Conflict:
+      description: Unique constraint violation / duplicate
+      content:
+        application/json: { schema: { $ref: '#/components/schemas/ErrorEnvelope' } }
+    TooManyRequests:
+      description: Rate limit exceeded
+      content:
+        application/json: { schema: { $ref: '#/components/schemas/ErrorEnvelope' } }
+    PaginatedUsers:
+      description: Paginated users
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: '#/components/schemas/PaginatedEnvelope'
+              - type: object
+                properties: { data: { type: array, items: { $ref: '#/components/schemas/User' } } }
+    PaginatedOrganizations:
+      description: Paginated organizations
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: '#/components/schemas/PaginatedEnvelope'
+              - type: object
+                properties: { data: { type: array, items: { $ref: '#/components/schemas/Organization' } } }
+    PaginatedHouseholds:
+      description: Paginated households
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: '#/components/schemas/PaginatedEnvelope'
+              - type: object
+                properties: { data: { type: array, items: { $ref: '#/components/schemas/Household' } } }
+    PaginatedVoters:
+      description: Paginated voters
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: '#/components/schemas/PaginatedEnvelope'
+              - type: object
+                properties: { data: { type: array, items: { $ref: '#/components/schemas/Voter' } } }
+    PaginatedImportJobs:
+      description: Paginated voter import jobs
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: '#/components/schemas/PaginatedEnvelope'
+              - type: object
+                properties: { data: { type: array, items: { $ref: '#/components/schemas/VoterImportJob' } } }
+    PaginatedImportIssues:
+      description: Paginated voter import row issues
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: '#/components/schemas/PaginatedEnvelope'
+              - type: object
+                properties: { data: { type: array, items: { $ref: '#/components/schemas/VoterImportRowIssue' } } }
+    PaginatedTasks:
+      description: Paginated canvassing tasks
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: '#/components/schemas/PaginatedEnvelope'
+              - type: object
+                properties: { data: { type: array, items: { $ref: '#/components/schemas/CanvassingTask' } } }
+    PaginatedVisits:
+      description: Paginated canvassing visits
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: '#/components/schemas/PaginatedEnvelope'
+              - type: object
+                properties: { data: { type: array, items: { $ref: '#/components/schemas/CanvassingVisit' } } }
+    PaginatedContacts:
+      description: Paginated voter contacts
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: '#/components/schemas/PaginatedEnvelope'
+              - type: object
+                properties: { data: { type: array, items: { $ref: '#/components/schemas/VoterContact' } } }
+
+  schemas:
+    SuccessEnvelope:
+      type: object
+      properties:
+        success: { type: boolean, example: true }
+        data: {}
+
+    PaginatedEnvelope:
+      type: object
+      properties:
+        success: { type: boolean, example: true }
+        data: { type: array, items: {} }
+        pagination:
+          type: object
+          properties:
+            page: { type: integer }
+            pageSize: { type: integer }
+            totalItems: { type: integer }
+            totalPages: { type: integer }
+
+    ErrorEnvelope:
+      type: object
+      properties:
+        success: { type: boolean, example: false }
+        error:
+          type: object
+          properties:
+            code: { type: string, example: BAD_REQUEST }
+            message: { type: string }
+            details: {}
+        requestId: { type: string }
+
+    UserRole:
+      type: string
+      enum: [SUPER_ADMIN, CAMPAIGN_ADMIN, WARD_MANAGER, TOLE_COORDINATOR, FIELD_WORKER, VOLUNTEER, ANALYST, VIEW_ONLY]
+
+    MunicipalityType:
+      type: string
+      enum: [METROPOLITAN_CITY, SUB_METROPOLITAN_CITY, MUNICIPALITY, RURAL_MUNICIPALITY]
+
+    User:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        organizationId: { type: string, format: uuid }
+        name: { type: string }
+        email: { type: string, format: email }
+        phone: { type: string, nullable: true }
+        role: { $ref: '#/components/schemas/UserRole' }
+        status: { type: string, enum: [ACTIVE, SUSPENDED, INVITED] }
+        address: { type: string, nullable: true, description: Mainly meaningful for VOLUNTEER/FIELD_WORKER accounts }
+        dateOfBirth: { type: string, format: date, nullable: true }
+        gender: { allOf: [{ $ref: '#/components/schemas/Gender' }], nullable: true }
+        lastLoginAt: { type: string, format: date-time, nullable: true }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    Organization:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        slug: { type: string }
+        status: { type: string, enum: [ACTIVE, SUSPENDED] }
+        createdAt: { type: string, format: date-time }
+
+    Province:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        code: { type: integer }
+        name: { type: string }
+        nameNepali: { type: string, nullable: true }
+
+    District:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        provinceId: { type: string, format: uuid }
+        code: { type: string }
+        name: { type: string }
+        nameNepali: { type: string, nullable: true }
+
+    Municipality:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        districtId: { type: string, format: uuid }
+        code: { type: string }
+        name: { type: string }
+        nameNepali: { type: string, nullable: true }
+        type: { $ref: '#/components/schemas/MunicipalityType' }
+        totalWards: { type: integer }
+
+    Ward:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        municipalityId: { type: string, format: uuid }
+        wardNumber: { type: integer }
+        name: { type: string, nullable: true }
+        population: { type: integer, nullable: true }
+
+    Tole:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        organizationId: { type: string, format: uuid }
+        wardId: { type: string, format: uuid }
+        name: { type: string }
+        nameNepali: { type: string, nullable: true }
+        centerLat: { type: number, nullable: true }
+        centerLng: { type: number, nullable: true }
+        boundary: { type: object, nullable: true, description: GeoJSON Polygon }
+
+    UserGeoAssignment:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        userId: { type: string, format: uuid }
+        wardId: { type: string, format: uuid }
+        toleId: { type: string, format: uuid, nullable: true }
+        assignedAt: { type: string, format: date-time }
+
+    Gender:
+      type: string
+      enum: [MALE, FEMALE, OTHER]
+
+    VoterSupportLevel:
+      type: string
+      enum: [STRONG_SUPPORTER, LEAN_SUPPORTER, UNDECIDED, LEAN_OPPOSED, STRONG_OPPOSED, UNKNOWN]
+      description: A single current classification, not a history — see docs/modules/02-households-voters.md
+
+    ImportJobStatus:
+      type: string
+      enum: [PROCESSING, COMPLETED, COMPLETED_WITH_ERRORS, FAILED]
+
+    Household:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        organizationId: { type: string, format: uuid }
+        wardId: { type: string, format: uuid }
+        toleId: { type: string, format: uuid, nullable: true }
+        address: { type: string }
+        landmark: { type: string, nullable: true }
+        centerLat: { type: number, nullable: true }
+        centerLng: { type: number, nullable: true }
+        headOfHouseholdId: { type: string, format: uuid, nullable: true }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    Voter:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        organizationId: { type: string, format: uuid }
+        wardId: { type: string, format: uuid }
+        toleId: { type: string, format: uuid, nullable: true }
+        householdId: { type: string, format: uuid, nullable: true }
+        fullName: { type: string }
+        dateOfBirth: { type: string, format: date }
+        gender: { allOf: [{ $ref: '#/components/schemas/Gender' }], nullable: true }
+        fatherOrSpouseName: { type: string, nullable: true }
+        citizenshipNumber: { type: string, nullable: true }
+        voterIdNumber: { type: string, nullable: true }
+        phone: { type: string, nullable: true }
+        occupation: { type: string, nullable: true }
+        address: { type: string, nullable: true }
+        status: { type: string, enum: [ACTIVE, DECEASED, MOVED] }
+        supportLevel: { $ref: '#/components/schemas/VoterSupportLevel' }
+        source: { type: string, enum: [MANUAL, IMPORT] }
+        importJobId: { type: string, format: uuid, nullable: true }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    VoterImportJob:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        organizationId: { type: string, format: uuid }
+        wardId: { type: string, format: uuid }
+        toleId: { type: string, format: uuid, nullable: true }
+        fileName: { type: string }
+        fileSizeBytes: { type: integer }
+        status: { $ref: '#/components/schemas/ImportJobStatus' }
+        totalRows: { type: integer }
+        importedRows: { type: integer }
+        duplicateRows: { type: integer }
+        errorRows: { type: integer }
+        uploadedById: { type: string, format: uuid }
+        startedAt: { type: string, format: date-time }
+        completedAt: { type: string, format: date-time, nullable: true }
+
+    VoterImportRowIssue:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        importJobId: { type: string, format: uuid }
+        rowNumber: { type: integer, description: 1-based, data rows only (header excluded) }
+        issueType: { type: string, enum: [VALIDATION_ERROR, DUPLICATE] }
+        message: { type: string }
+        rawData: { type: object, description: The original row as parsed from the file }
+        createdAt: { type: string, format: date-time }
+
+    TaskStatus:
+      type: string
+      enum: [PENDING, IN_PROGRESS, COMPLETED, CANCELLED]
+
+    VisitOutcome:
+      type: string
+      enum: [PENDING, VISITED, NOT_HOME, REFUSED, INVALID_ADDRESS]
+
+    VisitSummary:
+      type: object
+      description: Household outcome counts for a task, computed live from its visits
+      properties:
+        total: { type: integer }
+        pending: { type: integer }
+        visited: { type: integer }
+        notHome: { type: integer }
+        refused: { type: integer }
+        invalidAddress: { type: integer }
+
+    CanvassingTask:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        organizationId: { type: string, format: uuid }
+        wardId: { type: string, format: uuid }
+        toleId: { type: string, format: uuid, nullable: true }
+        title: { type: string }
+        description: { type: string, nullable: true }
+        status: { $ref: '#/components/schemas/TaskStatus' }
+        dueDate: { type: string, format: date, nullable: true }
+        assignedToId: { type: string, format: uuid }
+        visitSummary: { $ref: '#/components/schemas/VisitSummary' }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    CanvassingVisit:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        taskId: { type: string, format: uuid }
+        householdId: { type: string, format: uuid }
+        outcome: { $ref: '#/components/schemas/VisitOutcome' }
+        notes: { type: string, nullable: true }
+        visitedAt: { type: string, format: date-time, nullable: true }
+        visitedById: { type: string, format: uuid, nullable: true }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    GeoImportSummary:
+      type: object
+      description: Not a persisted resource — a computed report returned directly from the import call
+      properties:
+        totalRows: { type: integer }
+        provincesCreated: { type: integer }
+        provincesUpdated: { type: integer }
+        districtsCreated: { type: integer }
+        districtsUpdated: { type: integer }
+        municipalitiesCreated: { type: integer }
+        municipalitiesUpdated: { type: integer }
+        wardsCreated: { type: integer }
+        errorRows: { type: integer }
+        issues:
+          type: array
+          items:
+            type: object
+            properties:
+              rowNumber: { type: integer, description: 1-based, data rows only (header excluded) }
+              message: { type: string }
+
+    ContactMethod:
+      type: string
+      enum: [DOOR_KNOCK, PHONE_CALL, TEXT_MESSAGE, EMAIL, EVENT, OTHER]
+
+    ContactOutcome:
+      type: string
+      enum: [REACHED, NOT_REACHED, REFUSED, WRONG_CONTACT_INFO]
+
+    VoterContact:
+      type: object
+      description: Append-only — no update/delete endpoint
+      properties:
+        id: { type: string, format: uuid }
+        organizationId: { type: string, format: uuid }
+        voterId: { type: string, format: uuid }
+        method: { $ref: '#/components/schemas/ContactMethod' }
+        outcome: { $ref: '#/components/schemas/ContactOutcome' }
+        supportLevelObserved: { allOf: [{ $ref: '#/components/schemas/VoterSupportLevel' }], nullable: true }
+        notes: { type: string, nullable: true }
+        contactedAt: { type: string, format: date-time }
+        contactedById: { type: string, format: uuid }
+        canvassingVisitId: { type: string, format: uuid, nullable: true }
+        createdAt: { type: string, format: date-time }
+
+    EnumCountMap:
+      type: object
+      description: |
+        One key per possible enum value, plus an always-present "UNSET" key (only ever nonzero
+        for a nullable grouping column, e.g. Voter.gender) — every key's count defaults to 0.
+      additionalProperties: { type: integer }
+
+    DashboardSummary:
+      type: object
+      properties:
+        scope:
+          type: object
+          properties:
+            organizationId: { type: string, format: uuid }
+            wardId: { type: string, format: uuid, nullable: true }
+            toleId: { type: string, format: uuid, nullable: true }
+        households:
+          type: object
+          properties:
+            total: { type: integer }
+            withCoordinates: { type: integer, description: Has both centerLat and centerLng set }
+        voters:
+          type: object
+          properties:
+            total: { type: integer }
+            byStatus: { $ref: '#/components/schemas/EnumCountMap' }
+            byGender: { $ref: '#/components/schemas/EnumCountMap' }
+            bySupportLevel: { $ref: '#/components/schemas/EnumCountMap' }
+        canvassing:
+          type: object
+          properties:
+            tasks:
+              type: object
+              properties:
+                total: { type: integer }
+                byStatus: { $ref: '#/components/schemas/EnumCountMap' }
+            visits:
+              type: object
+              properties:
+                total: { type: integer }
+                byOutcome: { $ref: '#/components/schemas/EnumCountMap' }
+        contacts:
+          type: object
+          properties:
+            total: { type: integer }
+            byMethod: { $ref: '#/components/schemas/EnumCountMap' }
+            byOutcome: { $ref: '#/components/schemas/EnumCountMap' }
+
+    FamilyRelationType:
+      type: string
+      enum: [SPOUSE, PARENT_OF]
+      description: SPOUSE is symmetric; PARENT_OF is directional (voterId is the parent)
+
+    VoterRelationship:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        organizationId: { type: string, format: uuid }
+        voterId: { type: string, format: uuid }
+        relatedVoterId: { type: string, format: uuid }
+        type: { $ref: '#/components/schemas/FamilyRelationType' }
+        createdAt: { type: string, format: date-time }
+
+    VoterSummary:
+      type: object
+      description: A reduced Voter shape used inside family-tree/relationship responses
+      properties:
+        id: { type: string, format: uuid }
+        fullName: { type: string }
+        dateOfBirth: { type: string, format: date }
+        gender: { allOf: [{ $ref: '#/components/schemas/Gender' }], nullable: true }
+
+    FamilyTreeNode:
+      type: object
+      properties:
+        voter: { $ref: '#/components/schemas/VoterSummary' }
+        children:
+          type: array
+          items: { $ref: '#/components/schemas/FamilyTreeNode' }
+
+    FamilyTree:
+      type: object
+      properties:
+        headOfHousehold: { allOf: [{ $ref: '#/components/schemas/VoterSummary' }], nullable: true }
+        spouse: { allOf: [{ $ref: '#/components/schemas/VoterSummary' }], nullable: true }
+        children:
+          type: array
+          items: { $ref: '#/components/schemas/FamilyTreeNode' }
+        totalFamilyMembers: { type: integer }
